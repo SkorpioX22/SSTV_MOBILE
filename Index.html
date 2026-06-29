@@ -160,6 +160,7 @@ label{font-size:12px;color:var(--dim)}
 <div class="col card" style="flex:1">
 <div class="card-title">Status</div>
 <div class="stat"><span class="stat-label">Signal</span><span class="stat-value" id="rx-signal">-- dB</span></div>
+<div class="stat"><span class="stat-label">Freq</span><span class="stat-value" id="rx-freq">-- Hz</span></div>
 <div class="stat"><span class="stat-label">State</span><span class="stat-value" id="rx-state">IDLE</span></div>
 <div class="stat"><span class="stat-label">Line</span><span class="stat-value" id="rx-line">0 / 0</span></div>
 <div class="stat"><span class="stat-label">Pixels</span><span class="stat-value" id="rx-pixels">0 / 0</span></div>
@@ -298,26 +299,30 @@ class SSTVEncoder {
 }
 
 // ============================================================
-// SSTV DECODER
+// SSTV DECODER (ScriptProcessor + corrected zero-crossing)
 // ============================================================
 class SSTVDecoder {
   constructor(w, h, sr) {
-    this.w = w; this.h = h; this.sr = sr || 44100;
-    this.pixelSamp = Math.floor(CFG.pixelMs * this.sr / 1000);
+    this.w = w; this.h = h;
+    this.sr = sr || 44100;
+    this.measSamp = 512;
+    this.strideSamp = 88;
+    this.strideMs = this.strideSamp / this.sr * 1000;
+
     this.state = 'IDLE'; this.active = false;
     this.leaderMs = 0; this.lineIdx = 0; this.pixelIdx = 0;
     this.lineBuf = []; this.mode = null;
-    this.freqHist = []; this.confidence = 0.5;
-    this.syncStrength = 0; this.syncQuality = 0;
-    this.signalAmplitude = 0;
-    this.totalFrames = 0; this.validFrames = 0;
-    this.lastSyncTime = 0; this.syncTimings = [];
-    this.txMode = 'GRAYSCALE';
-    this.img = []; // [y][x][r,g,b]
+    this.txMode = 'GRAYSCALE'; this.allowVisOverride = true;
+    this.freqHist = []; this.freqAccum = [];
+    this.lastActivity = Date.now(); this.timeoutMs = 10000;
+    this.syncTimings = []; this.syncQuality = 0;
+    this.syncCount = 0; this.porchCount = 0;
+    this.totalFrames = 0; this.signalAmp = 0;
+    this.currentFreq = 0; this.currentAmp = 0;
 
+    this.img = [];
     this.online = null; this.onprogress = null;
     this.onstate = null; this.onsignal = null;
-
     this.reset();
   }
 
@@ -325,11 +330,10 @@ class SSTVDecoder {
     this.state = 'IDLE'; this.leaderMs = 0;
     this.lineIdx = 0; this.pixelIdx = 0;
     this.lineBuf = []; this.mode = null;
-    this.freqHist = []; this.confidence = 0.5;
-    this.syncStrength = 0; this.syncQuality = 0;
-    this.signalAmplitude = 0;
-    this.totalFrames = 0; this.validFrames = 0;
-    this.lastSyncTime = 0; this.lastActivity = Date.now(); this.timeoutMs = 8000; this.syncTimings = [];
+    this.freqHist = []; this.freqAccum = [];
+    this.syncCount = 0; this.porchCount = 0;
+    this.signalAmp = 0; this.totalFrames = 0;
+    this.lastActivity = Date.now(); this.syncTimings = [];
     this.img = [];
     for (let y = 0; y < this.h; y++) {
       this.img[y] = [];
@@ -337,111 +341,124 @@ class SSTVDecoder {
     }
   }
 
-  totalLines() { return this.txMode === 'GRAYSCALE' ? this.h : this.h * 3 }
-
+  totalLines() { return this.txMode === 'GRAYSCALE' ? this.h : this.h * 3; }
   start() { this.active = true; this.reset(); }
   stop() { this.active = false; }
 
   process(samples) {
     if (!this.active) return;
-    let si = 0;
-    while (si < samples.length) {
-      const chunk = samples.slice(si, si + this.pixelSamp);
-      if (chunk.length < this.pixelSamp) break;
-      si += this.pixelSamp;
-      this.processChunk(chunk);
+    this.freqAccum.push(...samples);
+    while (this.freqAccum.length >= this.measSamp) {
+      const buf = this.freqAccum.slice(0, this.measSamp);
+      this.measure(buf);
+      this.freqAccum.splice(0, this.strideSamp);
     }
   }
 
-  processChunk(chunk) {
+  measure(buf) {
     let zc = 0;
-    for (let i = 1; i < chunk.length; i++)
-      if (chunk[i - 1] < 0 && chunk[i] >= 0) zc++;
-    const freq = zc / (2 * chunk.length / this.sr);
     let amp = 0;
-    for (const s of chunk) { const a = Math.abs(s); if (a > amp) amp = a; }
-    this.signalAmplitude = this.signalAmplitude * 0.95 + amp * 0.05;
+    for (let i = 1; i < buf.length; i++) {
+      if (buf[i - 1] < 0 && buf[i] >= 0) zc++;
+      const a = Math.abs(buf[i]);
+      if (a > amp) amp = a;
+    }
+    this.currentFreq = zc * this.sr / this.measSamp;
+    this.currentAmp = amp;
+    this.signalAmp = this.signalAmp * 0.9 + amp * 0.1;
+    this.freqHist.push(this.currentFreq);
+    if (this.freqHist.length > 3) this.freqHist.shift();
     this.totalFrames++;
-    this.freqHist.push(freq);
-    if (this.freqHist.length > 8) this.freqHist.shift();
-    const sf = this.freqHist.reduce((a, b) => a + b, 0) / this.freqHist.length;
-
     if (amp < 0.005 && this.state === 'IDLE') {
-      if (this.onsignal) this.onsignal({ freq, amp, sf, state: this.state });
+      if (this.onsignal) this.onsignal(this.signalData());
       return;
     }
-
-    this.stateMachine(sf, amp, freq);
-    if (this.onsignal) this.onsignal({ freq, amp, sf, state: this.state, line: this.lineIdx, pixel: this.pixelIdx });
+    this.stateMachine();
+    if (this.onsignal) this.onsignal(this.signalData());
   }
 
-  stateMachine(sf, amp, rawFreq) {
+  get sf() {
+    const h = this.freqHist;
+    return h.length ? h.reduce((a, b) => a + b, 0) / h.length : 0;
+  }
+
+  signalData() {
+    return {
+      freq: this.currentFreq, amp: this.signalAmp, sf: this.sf,
+      state: this.state, line: this.lineIdx, pixel: this.pixelIdx
+    };
+  }
+
+  inRange(v, lo, hi) { return v >= lo && v <= hi; }
+
+  stateMachine() {
+    const sf = this.sf;
     switch (this.state) {
       case 'IDLE': {
-        if (sf > 1800 && sf < 2000) {
-          this.leaderMs += CFG.pixelMs;
+        if (this.inRange(sf, 1800, 2000)) {
+          this.leaderMs += this.strideMs;
           if (this.leaderMs > 400) {
             this.state = 'LEADER';
-            this.setSignal('Leader tone detected');
+            this.setSignal('Leader');
           }
         } else {
-          this.leaderMs = Math.max(0, this.leaderMs - 5);
+          this.leaderMs = Math.max(0, this.leaderMs - this.strideMs * 3);
         }
         break;
       }
       case 'LEADER': {
-        if (sf > 1100 && sf < 1300) {
+        if (this.inRange(sf, 1100, 1300)) {
           this.state = 'VIS_SYNC';
+          this.syncCount = 1;
           this.setSignal('VIS sync');
-        } else if (sf > 1400 && sf < 2400) {
-        } else {
+        } else if (this.inRange(sf, 1400, 2400)) {
+        } else if (this.signalAmp < 0.01) {
           this.state = 'IDLE'; this.leaderMs = 0;
         }
         break;
       }
       case 'VIS_SYNC': {
-        if (sf >= 1300 && sf < 1700) {
-          this.porchSkip = (this.porchSkip || 0) + 1;
-          if (this.porchSkip >= 2) {
-            this.state = 'VIS_PORCH';
-            this.porchSkip = 0;
-          }
-        } else if (sf >= 1700) {
+        this.syncCount++;
+        if (this.syncCount >= 9) {
           this.state = 'VIS_PORCH';
-          this.porchSkip = 0;
-        } else {
-          this.porchSkip = 0;
+          this.syncCount = 0;
+          this.setSignal('VIS porch');
         }
         break;
       }
       case 'VIS_PORCH': {
-        if (sf > 1700 && sf < 1950) {
+        if (this.inRange(sf, 1700, 1950)) {
           if (this.allowVisOverride !== false) { this.txMode = 'GRAYSCALE'; }
           this.mode = 'GRAYSCALE';
           this.state = 'VIS_MODE';
-          this.setSignal('Grayscale');
-        } else if (sf >= 1950 && sf < 2100) {
+          this.setSignal('Gray');
+          this.syncCount = 0;
+        } else if (this.inRange(sf, 1950, 2100)) {
           if (this.allowVisOverride !== false) { this.txMode = 'COLOR'; }
           this.mode = 'COLOR';
           this.state = 'VIS_MODE';
           this.setSignal('Color');
-        } else if (sf < 1100 || sf > 2500) {
+          this.syncCount = 0;
+        } else if (this.signalAmp < 0.01) {
           this.state = 'IDLE'; this.leaderMs = 0;
         }
         break;
       }
       case 'VIS_MODE': {
-        if (sf > 1100 && sf < 1300) {
-          this.state = 'VIS_SYNC2';
-        } else if (sf < 1000) { this.state = 'IDLE'; this.leaderMs = 0; }
-        break;
-      }
-      case 'VIS_SYNC2': {
-        if (sf >= 1300) {
-          this.state = 'LINE_WAIT';
-          this.lineIdx = 0; this.pixelIdx = 0;
-          this.lineBuf = [];
-          this.setSignal('Receiving...');
+        if (this.inRange(sf, 1100, 1300)) {
+          this.syncCount++;
+          if (this.syncCount >= 9) {
+            this.state = 'LINE_WAIT';
+            this.syncCount = 0;
+            this.lineIdx = 0; this.pixelIdx = 0;
+            this.lineBuf = [];
+            this.setSignal('Receiving...');
+          }
+        } else if (this.inRange(sf, 1800, 2100)) {
+        } else if (this.signalAmp < 0.01) {
+          this.state = 'IDLE'; this.leaderMs = 0;
+        } else {
+          this.syncCount = 0;
         }
         break;
       }
@@ -449,48 +466,37 @@ class SSTVDecoder {
         if (this.lineIdx > 0 && (Date.now() - this.lastActivity) > this.timeoutMs) {
           this.state = 'DONE'; this.active = false;
           this.setSignal('Complete');
-          this.progress();
-          break;
+          this.progress(); break;
         }
-        if (sf > 1100 && sf < 1300) {
-          this.state = 'LINE_SYNC';
-          this.syncQuality = 1;
-          this.porchSkip = 0;
-          this.syncTimings.push(Date.now());
-          if (this.syncTimings.length > 10) this.syncTimings.shift();
-          this.progress();
-        } else if (sf >= 1300 && sf <= 2400) {
+        if (this.inRange(sf, 1100, 1300)) {
+          this.syncCount++;
+          if (this.syncCount >= 2) {
+            this.state = 'LINE_SYNC';
+            this.syncCount = 0;
+            this.syncTimings.push(Date.now());
+            if (this.syncTimings.length > 10) this.syncTimings.shift();
+            this.progress();
+          }
         } else {
-          this.state = 'IDLE'; this.leaderMs = 0;
+          this.syncCount = 0;
         }
         break;
       }
       case 'LINE_SYNC': {
-        if (sf >= 1300 && sf < 1700) {
-          this.porchSkip = (this.porchSkip || 0) + 1;
-          if (this.porchSkip >= 2) {
-            this.state = 'LINE_DATA';
-            this.pixelIdx = 0;
-            this.lineBuf = [];
-            this.porchSkip = 0;
-          }
-        } else if (sf >= 1700) {
+        this.syncCount++;
+        if (this.syncCount >= 9) {
           this.state = 'LINE_DATA';
           this.pixelIdx = 0;
           this.lineBuf = [];
-          this.porchSkip = 0;
-        } else {
-          this.porchSkip = 0;
+          this.syncCount = 0;
         }
         break;
       }
       case 'LINE_DATA': {
         if (this.pixelIdx < this.w) {
-          const v = Math.max(0, Math.min(255, Math.round(((sf - CFG.blackFreq) / (CFG.whiteFreq - CFG.blackFreq)) * 255)));
-          const fErr = Math.abs(sf - rawFreq);
-          const conf = Math.max(0, 1 - fErr / 200);
-          this.validFrames += conf > 0.3 ? 1 : 0;
-          this.lineBuf.push({ val: v, conf });
+          const clamped = Math.max(CFG.blackFreq, Math.min(CFG.whiteFreq, this.currentFreq));
+          const v = Math.round(((clamped - CFG.blackFreq) / (CFG.whiteFreq - CFG.blackFreq)) * 255);
+          this.lineBuf.push({ val: v, conf: Math.min(1, this.signalAmp * 3) });
           this.pixelIdx++;
           if (this.pixelIdx >= this.w) this.state = 'LINE_DONE';
         }
@@ -535,20 +541,16 @@ class SSTVDecoder {
 
   progress() {
     if (this.onprogress) this.onprogress({
-      line: this.lineIdx,
-      total: this.totalLines(),
+      line: this.lineIdx, total: this.totalLines(),
       pct: this.totalLines() > 0 ? Math.round(this.lineIdx / this.totalLines() * 100) : 0
     });
   }
-
   setSignal(msg) { if (this.onstate) this.onstate(msg); }
 
   getConfidence() {
-    let total = 0; let count = 0;
+    let total = 0, count = 0;
     for (let y = 0; y < this.h; y++)
-      for (let x = 0; x < this.w; x++) {
-        total += this.img[y][x].conf || 0; count++;
-      }
+      for (let x = 0; x < this.w; x++) { total += this.img[y][x].conf || 0; count++; }
     return count > 0 ? Math.round(total / count * 100) : 0;
   }
 
@@ -558,7 +560,7 @@ class SSTVDecoder {
     for (let i = 1; i < this.syncTimings.length; i++)
       intervals.push(this.syncTimings[i] - this.syncTimings[i - 1]);
     const avg = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-    const expected = (CFG.syncMs + CFG.porchMs + this.w * CFG.pixelMs + CFG.lineEndMs);
+    const expected = CFG.syncMs + CFG.porchMs + this.w * CFG.pixelMs + CFG.lineEndMs;
     const err = Math.abs(avg - expected) / expected;
     return Math.max(0, Math.round((1 - err) * 100));
   }
@@ -824,17 +826,12 @@ const App = {
         this.micStream = stream;
         const src = this.rxCtx.createMediaStreamSource(stream);
 
-        // Analyser for visualization
+        // Analyser for visualization only
         this.rxAnalyser = this.rxCtx.createAnalyser();
         this.rxAnalyser.fftSize = 2048;
         src.connect(this.rxAnalyser);
 
-        // ScriptProcessor for decoding
-        this.scriptNode = this.rxCtx.createScriptProcessor(8192, 1, 1);
-        src.connect(this.scriptNode);
-        this.scriptNode.connect(this.rxCtx.destination);
-
-        // Decoder (use actual mic sample rate)
+        // Decoder (raw samples via ScriptProcessorNode)
         this.decoder = new SSTVDecoder(this.sstvW, this.sstvH, this.rxCtx.sampleRate);
         const rxModeSelect = document.getElementById('rx-mode-select');
         const userRxMode = rxModeSelect.value;
@@ -858,13 +855,17 @@ const App = {
         };
         this.decoder.onsignal = (s) => {
           document.getElementById('rx-signal').textContent = `${Math.round(s.amp * 1000)} mV`;
+          document.getElementById('rx-freq').textContent = `${Math.round(s.freq)} Hz`;
           document.getElementById('rx-pixels').textContent = `${s.pixel} / ${this.sstvW}`;
         };
 
+        // ScriptProcessorNode for raw audio access
+        this.scriptNode = this.rxCtx.createScriptProcessor(4096, 1, 1);
+        src.connect(this.scriptNode);
+        this.scriptNode.connect(this.rxCtx.destination);
         this.scriptNode.onaudioprocess = (e) => {
           if (!this.receiving) return;
-          const samples = e.inputBuffer.getChannelData(0);
-          this.decoder.process(samples);
+          this.decoder.process(e.inputBuffer.getChannelData(0));
           this.updateRXStats();
         };
 
